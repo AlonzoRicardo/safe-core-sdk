@@ -81,6 +81,7 @@ export type Safe4337CreateTransactionProps = {
     validAfter?: number
     feeEstimator?: IFeeEstimator
     customNonce?: bigint
+    paymasterTokenAddress?: string
   }
 }
 
