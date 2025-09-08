@@ -36,7 +36,8 @@ import {
   keccak256,
   slice,
   encodeAbiParameters,
-  parseAbiParameters
+  parseAbiParameters,
+  pad
 } from 'viem'
 import BaseSafeOperation from '@wdk-safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
 import SafeOperationFactory from '@wdk-safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
@@ -80,14 +81,33 @@ const MAX_ERC20_AMOUNT_TO_APPROVE =
 const EQ_OR_GT_1_4_1 = '>=1.4.1'
 
 const SAFE_PROXY_CREATION_CODES = {
-  // Early versions (1.0.0 - 1.2.0) use the older proxy creation code
-  //Note: legacy code is for L1 not L2, we can just delete it or keep it in case we want to support other versions in the future
-  legacy:
-    '0x608060405234801561001057600080fd5b506040516020806101a88339810180604052602081101561003057600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100c7576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260248152602001806101846024913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff16021790555050606e806101166000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054163660008037600080366000845af43d6000803e6000811415603d573d6000fd5b3d6000f3fea165627a7a723058201e7d648b83cfac072cbccefc2ffc62a6999d4a050ee87a721942de1da9670db80029496e76616c6964206d617374657220636f707920616464726573732070726f7669646564',
-  // Newer versions (1.3.0+) use the updated proxy creation code for L2
   latest:
-    '0x608060405234801561001057600080fd5b506040516101e63803806101e68339818101604052602081101561003357600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100ca576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260228152602001806101c46022913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505060ab806101196000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea264697066735822122003d1488ee65e08fa41e58e888a9865554c535f2c77126a82cb4c0f917f31441364736f6c63430007060033496e76616c69642073696e676c65746f6e20616464726573732070726f7669646564'
+    '0x608060405234801561001057600080fd5b506040516101e63803806101e68339818101604052602081101561003357600080fd5b8101908080519060200190929190505050600073ffffffffffffffffffffffffffffffffffffffff168173ffffffffffffffffffffffffffffffffffffffff1614156100ca576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004018080602001828103825260228152602001806101c46022913960400191505060405180910390fd5b806000806101000a81548173ffffffffffffffffffffffffffffffffffffffff021916908373ffffffffffffffffffffffffffffffffffffffff1602179055505060ab806101196000396000f3fe608060405273ffffffffffffffffffffffffffffffffffffffff600054167fa619486e0000000000000000000000000000000000000000000000000000000060003514156050578060005260206000f35b3660008037600080366000845af43d6000803e60008114156070573d6000fd5b3d6000f3fea264697066735822122003d1488ee65e08fa41e58e888a9865554c535f2c77126a82cb4c0f917f31441364736f6c63430007060033496e76616c69642073696e676c65746f6e20616464726573732070726f7669646564',
+  zkSync: {
+    latest:
+      '0x0000000000000000000000000000000000000000000000000000000000000000000000000100003b6cfa15bd7d1cae1c9c022074524d7785d34859ad0576d8fab4305d4f00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000'
+  }
 } as const
+
+const ZKSYNC_CREATE2_PREFIX = '0x2020dba91b30cc0006188af794c2fb30dd8520db7e2c088b7fc7c103c00ca494'
+const ZKSYNC_SAFE_PROXY_DEPLOYED_BYTECODE: { [version: string]: { deployedBytecodeHash: Hash } } = {
+  '1.3.0': {
+    deployedBytecodeHash: '0x0100004124426fb9ebb25e27d670c068e52f9ba631bd383279a188be47e3f86d'
+  },
+  '1.4.1': {
+    deployedBytecodeHash: '0x0100003b6cfa15bd7d1cae1c9c022074524d7785d34859ad0576d8fab4305d4f'
+  }
+}
+
+function zkSyncCreate2Address(from: string, safeVersion: string, salt: Hex, input: Hex): string {
+  const bytecodeHash = ZKSYNC_SAFE_PROXY_DEPLOYED_BYTECODE[safeVersion]?.deployedBytecodeHash
+  if (!bytecodeHash) throw new Error(`Unsupported Safe version for zkSync: ${safeVersion}`)
+  const inputHash = keccak256(input)
+  const addressBytes = keccak256(
+    concat([ZKSYNC_CREATE2_PREFIX, pad(asHex(from)), salt, bytecodeHash, inputHash])
+  ).slice(26)
+  return `0x${addressBytes}`
+}
 
 /**
  * Gets the Safe deployment information (version, factory, singleton).
@@ -176,23 +196,11 @@ function isZkSyncChain(chainId: bigint | number): boolean {
  * @returns {`0x${string}`} The proxy creation bytecode for the given Safe version.
  * @throws {Error} If called for a zkSync chain.
  */
-function getProxyCreationCode(safeVersion: string, chainId?: bigint | number): `0x${string}` {
+function getProxyCreationCode(chainId?: bigint | number): `0x${string}` {
   if (chainId && isZkSyncChain(chainId)) {
-    // TODO: implement zkSync
-    throw new Error(
-      `zkSync chains (${chainId}) use different CREATE2 mechanics. Use predictSafeAddressWithChainId for zkSync support.`
-    )
+    return SAFE_PROXY_CREATION_CODES.zkSync.latest
   }
-
-  const version = safeVersion.split('.')
-  const major = parseInt(version[0])
-  const minor = parseInt(version[1])
-
-  if (major === 1 && minor <= 2) {
-    return SAFE_PROXY_CREATION_CODES.legacy
-  } else {
-    return SAFE_PROXY_CREATION_CODES.latest
-  }
+  return SAFE_PROXY_CREATION_CODES.latest
 }
 
 /**
@@ -1107,10 +1115,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
   }): string {
     const chainIdBigInt = BigInt(chainId)
 
-    if (isZkSyncChain(chainId)) {
-      throw new Error('zkSync not yet supported.')
-    }
-
     const { factoryAddress, singletonAddress } = getSafeDeploymentInfo(chainIdBigInt, safeVersion)
 
     const network = chainIdBigInt.toString()
@@ -1172,10 +1176,15 @@ export class Safe4337Pack extends RelayKitBasePack<{
     const encodedNonce = encodeAbiParameters(parseAbiParameters('uint256'), [BigInt(saltNonce)])
     const salt = keccak256(concat([initializerHash as `0x${string}`, encodedNonce]))
 
-    const proxyCreationCode = getProxyCreationCode(safeVersion, chainIdBigInt)
+    const proxyCreationCode = getProxyCreationCode(chainIdBigInt)
 
     const checksummedSingletonAddress = getAddress(singletonAddress)
     const input = encodeAbiParameters(parseAbiParameters('address'), [checksummedSingletonAddress])
+
+    if (isZkSyncChain(chainId)) {
+      const proxyAddress = zkSyncCreate2Address(factoryAddress, safeVersion, salt, asHex(input))
+      return getAddress(proxyAddress)
+    }
     const initCode = concat([proxyCreationCode, asHex(input)])
 
     const hash = keccak256(
