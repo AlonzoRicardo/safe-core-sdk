@@ -1,6 +1,5 @@
 import { createPublicClient, http, toHex } from 'viem'
 import { EstimateGasData } from '@safe-global/types-kit'
-import { Eip1193Provider } from 'ethers'
 import { EstimateFeeFunctionProps, IFeeEstimator, UserOperationStringValues } from '../../types'
 import { createBundlerClient, userOperationToHexValues } from '../../utils'
 import { RPC_4337_CALLS } from '../../constants'
@@ -16,6 +15,10 @@ export type GenericFeeEstimatorOverrides = {
   defaultVerificationGasLimitOverhead?: bigint
 }
 
+export type GenericEip1193Provider = {
+  request: (args: { method: string; params?: any[] }) => Promise<any>
+}
+
 /**
  * GenericFeeEstimator is a class that implements the IFeeEstimator interface. You can implement three optional methods that will be called during the estimation process:
  * - preEstimateUserOperationGas: Setup the userOperation before calling the eth_estimateUserOperation gas method.
@@ -24,9 +27,9 @@ export type GenericFeeEstimatorOverrides = {
 export class GenericFeeEstimator implements IFeeEstimator {
   defaultVerificationGasLimitOverhead: bigint
   overrides: GenericFeeEstimatorOverrides
-  rpc: string | Eip1193Provider
+  rpc: string | GenericEip1193Provider
 
-  constructor(rpc: string, overrides: GenericFeeEstimatorOverrides = {}) {
+  constructor(rpc: string | GenericEip1193Provider, overrides: GenericFeeEstimatorOverrides = {}) {
     this.defaultVerificationGasLimitOverhead =
       overrides.defaultVerificationGasLimitOverhead ?? 35_000n
     this.overrides = overrides
@@ -173,14 +176,9 @@ export class GenericFeeEstimator implements IFeeEstimator {
   }
 
   async #getUserOperationGasPrices(
-    rpc: string | Eip1193Provider
+    rpc: string | GenericEip1193Provider
   ): Promise<Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>> {
-    const client =
-      typeof rpc === 'string'
-        ? createPublicClient({
-            transport: http(rpc)
-          })
-        : rpc
+    const client = typeof rpc === 'string' ? createPublicClient({ transport: http(rpc) }) : rpc
     const [block, maxPriorityFeePerGas] = await Promise.all([
       client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] }),
       client.request({ method: 'eth_maxPriorityFeePerGas' })
