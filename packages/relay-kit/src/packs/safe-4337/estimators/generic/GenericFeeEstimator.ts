@@ -191,7 +191,7 @@ export class GenericFeeEstimator implements IFeeEstimator {
     }
 
     // Calculate maxFeePerGas
-    const maxFeePerGas = baseFeePerGas + maxPriorityFeePerGas
+    const maxFeePerGas = BigInt(baseFeePerGas) + BigInt(maxPriorityFeePerGas)
     return {
       maxFeePerGas: BigInt(
         Math.ceil(Number(maxFeePerGas) * (this.overrides.maxFeePerGasMultiplier ?? 1.5))
