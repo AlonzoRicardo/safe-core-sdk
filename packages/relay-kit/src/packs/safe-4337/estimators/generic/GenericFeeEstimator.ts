@@ -1,4 +1,4 @@
-import { createPublicClient, http, toHex } from 'viem'
+import { createPublicClient, Hex, http, RpcBlock, toHex } from 'viem'
 import { EstimateGasData } from '@safe-global/types-kit'
 import { EstimateFeeFunctionProps, IFeeEstimator, UserOperationStringValues } from '../../types'
 import { createBundlerClient, userOperationToHexValues } from '../../utils'
@@ -16,7 +16,7 @@ export type GenericFeeEstimatorOverrides = {
 }
 
 export type GenericEip1193Provider = {
-  request: (args: { method: string; params?: any[] }) => Promise<any>
+  request: (args: { method: string; params?: any[] }) => Promise<unknown>
 }
 
 /**
@@ -180,8 +180,11 @@ export class GenericFeeEstimator implements IFeeEstimator {
   ): Promise<Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>> {
     const client = typeof rpc === 'string' ? createPublicClient({ transport: http(rpc) }) : rpc
     const [block, maxPriorityFeePerGas] = await Promise.all([
-      client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] }),
-      client.request({ method: 'eth_maxPriorityFeePerGas' })
+      client.request({
+        method: 'eth_getBlockByNumber',
+        params: ['latest', false]
+      }) as Promise<RpcBlock>,
+      client.request({ method: 'eth_maxPriorityFeePerGas' }) as Promise<Hex>
     ])
     // Base fee from the block (can be undefined for non-EIP1559 blocks)
     const baseFeePerGas = block.baseFeePerGas
