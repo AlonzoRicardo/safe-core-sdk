@@ -179,13 +179,10 @@ export class GenericFeeEstimator implements IFeeEstimator {
     rpc: string | GenericEip1193Provider
   ): Promise<Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>> {
     const client = typeof rpc === 'string' ? createPublicClient({ transport: http(rpc) }) : rpc
-    const [block, maxPriorityFeePerGas] = await Promise.all([
-      client.request({
-        method: 'eth_getBlockByNumber',
-        params: ['latest', false]
-      }) as Promise<RpcBlock>,
-      client.request({ method: 'eth_maxPriorityFeePerGas' }) as Promise<Hex>
-    ])
+    const [block, maxPriorityFeePerGas] = (await Promise.all([
+      client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] }),
+      client.request({ method: 'eth_maxPriorityFeePerGas' })
+    ])) as [RpcBlock, Hex]
     // Base fee from the block (can be undefined for non-EIP1559 blocks)
     const baseFeePerGas = block.baseFeePerGas
 
