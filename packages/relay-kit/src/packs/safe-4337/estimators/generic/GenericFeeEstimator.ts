@@ -16,7 +16,7 @@ export type GenericFeeEstimatorOverrides = {
 }
 
 export type GenericEip1193Provider = {
-  request: (args: { method: string; params?: any[] }) => Promise<unknown>
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>
 }
 
 /**
