@@ -7,10 +7,11 @@ import Safe, {
   PasskeyClient,
   SafeProvider,
   generateOnChainIdentifier,
-  SafeAccountConfig
-} from '@wdk-safe-global/protocol-kit'
+  SafeAccountConfig,
+  predictSafeAddress
+} from '@tetherto/wdk-safe-protocol-kit'
 import { SafeVersion } from '@safe-global/types-kit'
-import { RelayKitBasePack } from '@wdk-safe-global/relay-kit/RelayKitBasePack'
+import { RelayKitBasePack } from '@tetherto/wdk-safe-relay-kit/RelayKitBasePack'
 import {
   OperationType,
   SafeOperationConfirmation,
@@ -40,8 +41,8 @@ import {
   parseAbiParameters,
   pad
 } from 'viem'
-import BaseSafeOperation from '@wdk-safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
-import SafeOperationFactory from '@wdk-safe-global/relay-kit/packs/safe-4337/SafeOperationFactory'
+import BaseSafeOperation from './BaseSafeOperation'
+import SafeOperationFactory from './SafeOperationFactory'
 import {
   EstimateFeeProps,
   Safe4337CreateTransactionProps,
@@ -51,14 +52,16 @@ import {
   UserOperationReceipt,
   UserOperationWithPayload,
   PaymasterOptions,
-  BundlerClient
-} from '@wdk-safe-global/relay-kit/packs/safe-4337/types'
+  BundlerClient,
+  PimlicoTokenQuotesResponse,
+  DefaultPaymasterTokensResponse
+} from './types'
 import {
   ABI,
   DEFAULT_SAFE_VERSION,
   DEFAULT_SAFE_MODULES_VERSION,
   RPC_4337_CALLS
-} from '@wdk-safe-global/relay-kit/packs/safe-4337/constants'
+} from './constants'
 import {
   entryPointToSafeModules,
   getDummySignature,
@@ -66,18 +69,17 @@ import {
   userOperationToHexValues,
   getRelayKitVersion,
   createUserOperation
-} from '@wdk-safe-global/relay-kit/packs/safe-4337/utils'
-import { PimlicoFeeEstimator } from '@wdk-safe-global/relay-kit/packs/safe-4337/estimators/pimlico/PimlicoFeeEstimator'
+} from './utils'
+import { PimlicoFeeEstimator } from './estimators/pimlico/PimlicoFeeEstimator'
 
-const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+const MAX_ERC20_AMOUNT_TO_APPROVE =
+  0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn
+
 const EMPTY_DATA = '0x'
 
 function asHex(hex?: string): Hex {
   return isHex(hex) ? (hex as Hex) : (`0x${hex}` as Hex)
 }
-
-const MAX_ERC20_AMOUNT_TO_APPROVE =
-  0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffn
 
 const EQ_OR_GT_1_4_1 = '>=1.4.1'
 
@@ -196,6 +198,7 @@ function isZkSyncChain(chainId: bigint | number): boolean {
  * @param {bigint | number} [chainId] - Optional chain ID; if a zkSync chain is detected, an error is thrown.
  * @returns {`0x${string}`} The proxy creation bytecode for the given Safe version.
  * @throws {Error} If called for a zkSync chain.
+ * @return {`0x${string}`}
  */
 function getProxyCreationCode(chainId?: bigint | number): `0x${string}` {
   if (chainId && isZkSyncChain(chainId)) {
@@ -222,12 +225,12 @@ function encodeSetupCallDataSync(
   const {
     owners,
     threshold,
-    to = ZERO_ADDRESS,
+    to = zeroAddress,
     data = EMPTY_DATA,
-    fallbackHandler = ZERO_ADDRESS,
-    paymentToken = ZERO_ADDRESS,
+    fallbackHandler = zeroAddress,
+    paymentToken = zeroAddress,
     payment = 0,
-    paymentReceiver = ZERO_ADDRESS
+    paymentReceiver = zeroAddress
   } = safeAccountConfig
 
   const version = safeVersion.split('.')
@@ -300,7 +303,7 @@ function encodeSetupCallDataSync(
     return setupData
   }
 }
-
+const USDT_ON_MAINNET = '0xdAC17F958D2ee523a2206206994597C13D831ec7'
 /**
  * Safe4337Pack class that extends RelayKitBasePack.
  * This class provides an implementation of the ERC-4337 that enables Safe accounts to wrk with UserOperations.
@@ -484,13 +487,71 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
       const setupTransactions = [enable4337ModuleTransaction]
 
+      // Initialize deployment variables early
+      let deploymentTo = enable4337ModuleTransaction.to
+      let deploymentData = enable4337ModuleTransaction.data
+
       const isApproveTransactionRequired =
         !!paymasterOptions &&
         !paymasterOptions.isSponsored &&
-        !!paymasterOptions.paymasterTokenAddress
+        !!paymasterOptions.paymasterTokenAddress &&
+        !paymasterOptions.skipApproveTransaction
 
-      if (isApproveTransactionRequired && !paymasterOptions.skipApproveTransaction) {
+      if (isApproveTransactionRequired) {
         const { paymasterAddress, amountToApprove = MAX_ERC20_AMOUNT_TO_APPROVE } = paymasterOptions
+
+        // Handle USDT on Mainnet special case - must reset allowance to 0 first if current allowance != 0
+        if (
+          paymasterOptions.paymasterTokenAddress.toLowerCase() === USDT_ON_MAINNET.toLowerCase()
+        ) {
+          // Get the predicted Safe address to check current allowance
+          const predictedSafeAddress = await predictSafeAddress({
+            safeProvider: await SafeProvider.init({ provider, signer, safeVersion }),
+            chainId: BigInt(chainId),
+            safeAccountConfig: {
+              owners: options.owners,
+              threshold: options.threshold,
+              to: deploymentTo,
+              data: deploymentData,
+              fallbackHandler: safe4337ModuleAddress,
+              paymentToken: zeroAddress,
+              payment: 0,
+              paymentReceiver: zeroAddress
+            },
+            safeDeploymentConfig: {
+              safeVersion,
+              saltNonce: options.saltNonce || undefined,
+              deploymentType: options.deploymentType || undefined
+            }
+          })
+
+          // Create a SafeProvider to read contract data
+          const tempSafeProvider = await SafeProvider.init({ provider, signer, safeVersion })
+
+          // Check current allowance to paymaster using SafeProvider's readContract
+          const currentAllowance = await tempSafeProvider.readContract({
+            address: paymasterOptions.paymasterTokenAddress as `0x${string}`,
+            abi: ABI,
+            functionName: 'allowance',
+            args: [predictedSafeAddress as `0x${string}`, paymasterAddress]
+          })
+
+          // Only reset if current allowance is not 0
+          if (currentAllowance !== 0n) {
+            const resetApproveToPaymasterTransaction = {
+              to: paymasterOptions.paymasterTokenAddress,
+              data: encodeFunctionData({
+                abi: ABI,
+                functionName: 'approve',
+                args: [paymasterAddress, 0n]
+              }),
+              value: '0',
+              operation: OperationType.Call // Call for approve
+            }
+
+            setupTransactions.push(resetApproveToPaymasterTransaction)
+          }
+        }
 
         // second transaction: approve ERC-20 paymaster token
         const approveToPaymasterTransaction = {
@@ -547,9 +608,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
         setupTransactions.push(sharedSignerTransaction)
       }
 
-      let deploymentTo
-      let deploymentData
-
       const isBatch = setupTransactions.length > 1
 
       if (isBatch) {
@@ -567,9 +625,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
         deploymentTo = multiSendContract.getAddress()
         deploymentData = batchData
-      } else {
-        deploymentTo = enable4337ModuleTransaction.to
-        deploymentData = enable4337ModuleTransaction.data
       }
 
       protocolKit = await Safe.init({
@@ -645,22 +700,24 @@ export class Safe4337Pack extends RelayKitBasePack<{
    *
    * @param {EstimateFeeProps} props - The parameters for the gas estimation.
    * @param {BaseSafeOperation} props.safeOperation - The SafeOperation to estimate the gas.
-   * @param {PaymasterOptions} props.paymasterOptions - The paymaster options.
    * @param {IFeeEstimator} props.feeEstimator - The function to estimate the gas.
    * @return {Promise<BaseSafeOperation>} The Promise object that will be resolved into the gas estimation.
    */
 
   async getEstimateFee({
     safeOperation,
-    paymasterOptions,
-    feeEstimator = new PimlicoFeeEstimator()
+    feeEstimator = new PimlicoFeeEstimator(),
+    paymasterOptions
   }: EstimateFeeProps): Promise<BaseSafeOperation> {
     const threshold = await this.protocolKit.getThreshold()
+    const options = paymasterOptions || this.#paymasterOptions
+
     const preEstimationData = await feeEstimator?.preEstimateUserOperationGas?.({
       bundlerUrl: this.#BUNDLER_URL,
       entryPoint: this.#ENTRYPOINT_ADDRESS,
       userOperation: safeOperation.getUserOperation(),
-      paymasterOptions
+      paymasterOptions: options,
+      protocolKit: this.protocolKit
     })
 
     if (preEstimationData) {
@@ -688,7 +745,6 @@ export class Safe4337Pack extends RelayKitBasePack<{
           BigInt(threshold) * feeEstimator.defaultVerificationGasLimitOverhead
         ).toString()
       }
-
       safeOperation.addEstimations(estimateUserOperationGas)
     }
 
@@ -699,14 +755,20 @@ export class Safe4337Pack extends RelayKitBasePack<{
         ...safeOperation.getUserOperation(),
         signature: getDummySignature(this.#SAFE_WEBAUTHN_SHARED_SIGNER_ADDRESS, threshold)
       },
-      paymasterOptions
+      paymasterOptions: options,
+      protocolKit: this.protocolKit
     })
 
     if (postEstimationData) {
+      // GenericFeeEstimator might add overhead in postEstimate, but we ensure it here if provided in data
       if (
         feeEstimator.defaultVerificationGasLimitOverhead != null &&
         postEstimationData.verificationGasLimit != null
       ) {
+        // Check if override already applied by checking if it matches estimation?
+        // Actually, GenericFeeEstimator applies it in postEstimate.
+        // But for safety, we can leave it to estimator or apply if missing.
+        // The previous code in tether_Safe4337Pack applied it here too.
         postEstimationData.verificationGasLimit = (
           BigInt(postEstimationData.verificationGasLimit) +
           BigInt(threshold) * feeEstimator.defaultVerificationGasLimitOverhead
@@ -735,21 +797,31 @@ export class Safe4337Pack extends RelayKitBasePack<{
       validAfter,
       feeEstimator,
       customNonce,
-      paymasterTokenAddress
+      paymasterTokenAddress,
+      isSponsored,
+      sponsorshipPolicyId
     } = options
 
     const paymasterOptions: PaymasterOptions = this.#paymasterOptions
       ? { ...this.#paymasterOptions }
       : undefined
 
-    if (paymasterOptions && !paymasterOptions.isSponsored && paymasterTokenAddress) {
-      paymasterOptions.paymasterTokenAddress = paymasterTokenAddress
+    if (paymasterOptions) {
+      if (isSponsored) {
+        // Switch to SponsoredPaymasterOption
+        ;(paymasterOptions as any).isSponsored = true
+        ;(paymasterOptions as any).sponsorshipPolicyId = sponsorshipPolicyId
+        delete (paymasterOptions as any).paymasterTokenAddress
+        delete (paymasterOptions as any).amountToApprove
+      } else if (!paymasterOptions.isSponsored && paymasterTokenAddress) {
+        paymasterOptions.paymasterTokenAddress = paymasterTokenAddress
+      }
     }
 
     const userOperation = await createUserOperation(this.protocolKit, transactions, {
       entryPoint: this.#ENTRYPOINT_ADDRESS,
       paymasterOptions,
-      amountToApprove,
+      amountToApprove: isSponsored ? undefined : amountToApprove,
       customNonce
     })
 
@@ -767,8 +839,8 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
     return await this.getEstimateFee({
       safeOperation,
-      paymasterOptions,
-      feeEstimator
+      feeEstimator,
+      paymasterOptions
     })
   }
 
@@ -891,61 +963,22 @@ export class Safe4337Pack extends RelayKitBasePack<{
 
         const signerAddress = signer.account.address
         const safeOperation = safeOp.getSafeOperation()
-
-        // Prepare the parameters for signTypedData
-        const domain = {
-          chainId: Number(this.#chainId),
-          verifyingContract: this.#SAFE_4337_MODULE_ADDRESS
-        }
-
-        const types = safeOp.getEIP712Type()
-
-        const message = {
-          ...safeOperation,
-          nonce: BigInt(safeOperation.nonce),
-          validAfter: toHex(safeOperation.validAfter),
-          validUntil: toHex(safeOperation.validUntil),
-          maxFeePerGas: toHex(safeOperation.maxFeePerGas),
-          maxPriorityFeePerGas: toHex(safeOperation.maxPriorityFeePerGas)
-        }
-
-        let signature: string
-
-        // Use a try-catch to support both viem and ethers.js signers
-        try {
-          // First try the standard viem way
-          signature = await signer.signTypedData({
-            domain,
-            types,
-            message,
-            primaryType: 'SafeOp'
-          })
-        } catch (error) {
-          // If viem fails, try ethers.js way using a type assertion
-          const ethersCompatibleSigner = signer as any
-
-          if (typeof ethersCompatibleSigner._signTypedData === 'function') {
-            // Ethers v5
-            signature = await ethersCompatibleSigner._signTypedData(domain, types, message)
-          } else if (typeof ethersCompatibleSigner.signTypedData === 'function') {
-            // Ethers v6 with different parameter format
-            try {
-              // Try calling with object format first (some implementations support this)
-              signature = await ethersCompatibleSigner.signTypedData({
-                domain,
-                types,
-                primaryType: 'SafeOp',
-                message
-              })
-            } catch {
-              // Fallback to ethers v6 standard format
-              signature = await ethersCompatibleSigner.signTypedData(domain, types, message)
-            }
-          } else {
-            // Re-throw if we couldn't handle it
-            throw error
-          }
-        }
+        const signature = await signer.signTypedData({
+          domain: {
+            chainId: Number(this.#chainId),
+            verifyingContract: this.#SAFE_4337_MODULE_ADDRESS
+          },
+          types: safeOp.getEIP712Type(),
+          message: {
+            ...safeOperation,
+            nonce: BigInt(safeOperation.nonce),
+            validAfter: toHex(safeOperation.validAfter),
+            validUntil: toHex(safeOperation.validUntil),
+            maxFeePerGas: toHex(safeOperation.maxFeePerGas),
+            maxPriorityFeePerGas: toHex(safeOperation.maxPriorityFeePerGas)
+          },
+          primaryType: 'SafeOp'
+        })
 
         safeSignature = new EthSafeSignature(signerAddress, signature)
       } else {
@@ -1038,10 +1071,10 @@ export class Safe4337Pack extends RelayKitBasePack<{
    * Returns the exchange rate applied by the paymaster.
    *
    * @param {string} tokenAddress - The address of the token to get the exchange rate for.
-   * @returns {Promise<number>} - The exchange rate for the token used by the paymaster.
+   * @returns {Promise<bigint>} - The exchange rate for the token used by the paymaster.
    * @throws {Error} If paymaster URL is not configured or if the token is not supported
    */
-  async getTokenExchangeRate(tokenAddress: string): Promise<number> {
+  async getTokenExchangeRate(tokenAddress: string): Promise<bigint> {
     if (!this.#paymasterOptions?.paymasterUrl) {
       throw new Error('Paymaster URL is not configured')
     }
@@ -1050,34 +1083,34 @@ export class Safe4337Pack extends RelayKitBasePack<{
     const isPimlico = this.#paymasterOptions.paymasterUrl.includes('pimlico')
 
     if (isPimlico) {
-      const response = await bundlerClient.request({
+      const response = (await bundlerClient.request({
         method: 'pimlico_getTokenQuotes',
         params: [
           {
             tokens: [tokenAddress]
           },
           this.#ENTRYPOINT_ADDRESS,
-          '0x' + this.#chainId.toString(16)
+          `0x${this.#chainId.toString(16)}`
         ]
-      })
+      })) as PimlicoTokenQuotesResponse
 
-      return parseInt(response.quotes[0].exchangeRate, 16)
+      const quote = response.quotes[0]
+      return BigInt(quote.exchangeRate)
     } else {
-      const response = await bundlerClient.request({
+      const response = (await bundlerClient.request({
         method: 'pm_supportedERC20Tokens',
         params: [this.#ENTRYPOINT_ADDRESS]
-      })
+      })) as DefaultPaymasterTokensResponse
 
       const matchingToken = response.tokens.find(
-        (token: { address: string; exchangeRate: string }) =>
-          token.address.toLowerCase() === tokenAddress.toLowerCase()
+        (token) => token.address.toLowerCase() === tokenAddress.toLowerCase()
       )
 
       if (!matchingToken) {
         throw new Error(`No exchange rate found for token: ${tokenAddress}`)
       }
 
-      return parseInt(matchingToken.exchangeRate, 16)
+      return BigInt(matchingToken.exchangeRate)
     }
   }
 
@@ -1105,7 +1138,7 @@ export class Safe4337Pack extends RelayKitBasePack<{
     saltNonce,
     chainId,
     safeVersion = '1.4.1',
-    safeModulesVersion = '0.2.0',
+    safeModulesVersion = DEFAULT_SAFE_MODULES_VERSION,
     paymasterOptions
   }: {
     threshold: number
