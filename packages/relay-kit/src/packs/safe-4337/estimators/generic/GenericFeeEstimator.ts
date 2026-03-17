@@ -1,19 +1,18 @@
+import { createPublicClient, http, toHex } from 'viem'
 import { EstimateGasData } from '@safe-global/types-kit'
-import {
-  EstimateFeeFunctionProps,
-  IFeeEstimator,
-  UserOperationStringValues
-} from '@wdk-safe-global/relay-kit/packs/safe-4337/types'
-import { createPublicClient, http, custom } from 'viem'
-import {
-  createBundlerClient,
-  userOperationToHexValues
-} from '@wdk-safe-global/relay-kit/packs/safe-4337/utils'
-import { RPC_4337_CALLS } from '@wdk-safe-global/relay-kit/packs/safe-4337/constants'
-import { PaymasterRpcSchema } from './types'
+import { EstimateFeeFunctionProps, IFeeEstimator, UserOperationStringValues } from '../../types'
+import { createBundlerClient, userOperationToHexValues } from '../../utils'
+import { RPC_4337_CALLS } from '../../constants'
 
-type Eip1193Provider = {
-  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>
+export type GenericFeeEstimatorOverrides = {
+  callGasLimit?: bigint
+  verificationGasLimit?: bigint
+  preVerificationGas?: bigint
+  maxFeePerGas?: bigint
+  maxPriorityFeePerGas?: bigint
+  maxFeePerGasMultiplier?: number
+  maxPriorityFeePerGasMultiplier?: number
+  defaultVerificationGasLimitOverhead?: bigint
 }
 
 /**
@@ -22,79 +21,124 @@ type Eip1193Provider = {
  * - postEstimateUserOperationGas: Adjust the userOperation values returned after calling the eth_estimateUserOperation method.
  */
 export class GenericFeeEstimator implements IFeeEstimator {
-  provider: string | Eip1193Provider
-  chainId: string
-  gasMultiplier: number
-  defaultVerificationGasLimitOverhead?: bigint
+  defaultVerificationGasLimitOverhead: bigint
+  overrides: GenericFeeEstimatorOverrides
+  rpcUrl: string
 
-  constructor(provider: string | Eip1193Provider, chainId: string, gasMultiplier: number = 1.5) {
-    this.provider = provider
-    this.chainId = chainId
-    if (gasMultiplier <= 0) {
-      throw new Error("gasMultiplier can't be equal or less than 0.")
-    }
-    this.gasMultiplier = gasMultiplier
-    this.defaultVerificationGasLimitOverhead = 55_000n
+  constructor(rpcUrl: string, overrides: GenericFeeEstimatorOverrides = {}) {
+    this.defaultVerificationGasLimitOverhead =
+      overrides.defaultVerificationGasLimitOverhead ?? 35_000n
+    this.overrides = overrides
+    this.rpcUrl = rpcUrl
   }
 
   async preEstimateUserOperationGas({
-    bundlerUrl, // eslint-disable-line @typescript-eslint/no-unused-vars
     userOperation,
     entryPoint,
-    paymasterOptions
+    paymasterOptions,
+    protocolKit
   }: EstimateFeeFunctionProps): Promise<EstimateGasData> {
-    bundlerUrl
+    let feeDataRes: EstimateGasData = {}
+    let paymasterStubDataRes = {}
+
     if (paymasterOptions) {
-      const paymasterClient = createBundlerClient<PaymasterRpcSchema>(paymasterOptions.paymasterUrl)
+      const chainId = await protocolKit.getChainId()
+      const paymasterClient = createBundlerClient(paymasterOptions.paymasterUrl)
       const context =
         'paymasterTokenAddress' in paymasterOptions
           ? {
               token: paymasterOptions.paymasterTokenAddress
             }
-          : {}
+          : (paymasterOptions.paymasterContext ?? {})
 
       const [feeData, paymasterStubData] = await Promise.all([
-        this.#getUserOperationGasPrices(),
+        this.#getUserOperationGasPrices(this.rpcUrl),
         paymasterClient.request({
           method: RPC_4337_CALLS.GET_PAYMASTER_STUB_DATA,
           params: [
             userOperationToHexValues(userOperation, entryPoint),
             entryPoint,
-            this.chainId,
+            toHex(chainId),
             context
           ]
         })
       ])
-      return {
-        ...feeData,
-        ...paymasterStubData
-      }
+      feeDataRes = feeData
+      paymasterStubDataRes = paymasterStubData
     } else {
-      const feeData = await this.#getUserOperationGasPrices()
-      return {
-        ...feeData,
-        ...{}
-      }
+      const feeData = await this.#getUserOperationGasPrices(this.rpcUrl)
+      feeDataRes = feeData
     }
+
+    feeDataRes.callGasLimit = this.overrides.callGasLimit ?? feeDataRes.callGasLimit
+    feeDataRes.verificationGasLimit =
+      this.overrides.verificationGasLimit ?? feeDataRes.verificationGasLimit
+    feeDataRes.preVerificationGas =
+      this.overrides.preVerificationGas ?? feeDataRes.preVerificationGas
+    feeDataRes.maxFeePerGas = this.overrides.maxFeePerGas ?? feeDataRes.maxFeePerGas
+    feeDataRes.maxPriorityFeePerGas =
+      this.overrides.maxPriorityFeePerGas ?? feeDataRes.maxPriorityFeePerGas
+
+    const result = {
+      ...feeDataRes,
+      ...paymasterStubDataRes
+    }
+    if (result.verificationGasLimit != null) {
+      const threshold = await protocolKit.getThreshold()
+      result.verificationGasLimit = (
+        BigInt(result.verificationGasLimit) +
+        BigInt(threshold) * this.defaultVerificationGasLimitOverhead
+      ).toString()
+    }
+    return result
   }
 
   async postEstimateUserOperationGas({
     userOperation,
     entryPoint,
-    paymasterOptions
+    paymasterOptions,
+    protocolKit
   }: EstimateFeeFunctionProps): Promise<EstimateGasData> {
+    if (protocolKit == null) {
+      throw new Error("Can't use GenericFeeEstimator if protocolKit is null.")
+    }
+
+    const chainId = await protocolKit.getChainId()
+
     if (!paymasterOptions) return {}
 
-    const paymasterClient = createBundlerClient<PaymasterRpcSchema>(paymasterOptions.paymasterUrl)
+    // Bump callGasLimit by 50% if it exists, to cover execution variances (e.g. USDT cold storage)
+    // Only apply this fix for USDT transfers on Ethereum Mainnet
+    if (userOperation.callGasLimit && chainId === 1n) {
+      const USDT_MAINNET = '0xdac17f958d2ee523a2206206994597c13d831ec7'
+      // Safe 4337 Module callData structure: executeUserOp(to, value, data, operation)
+      // selector: 0x7bb37428 (4 bytes) -> chars 0-9
+      // arg1 (to): 32 bytes (64 chars) -> chars 10-73. The address is the last 40 chars: 34-73
+      const callData = userOperation.callData.toString().toLowerCase()
+      if (callData.startsWith('0x7bb37428')) {
+        const toAddress = '0x' + callData.slice(34, 74)
+        if (toAddress === USDT_MAINNET) {
+          const oldLimit = BigInt(userOperation.callGasLimit)
+          userOperation.callGasLimit = (oldLimit * 150n) / 100n
+        }
+      }
+    }
+
+    const paymasterClient = createBundlerClient(paymasterOptions.paymasterUrl)
     if (paymasterOptions.isSponsored) {
-      const params: [UserOperationStringValues, string, string, { sponsorshipPolicyId: string }?] =
-        [userOperationToHexValues(userOperation, entryPoint), entryPoint, this.chainId]
+      const params: [UserOperationStringValues, string, string, Record<string, unknown>?] = [
+        userOperationToHexValues(userOperation, entryPoint),
+        entryPoint,
+        toHex(chainId)
+      ]
+
+      const paymasterContext = paymasterOptions.paymasterContext || {}
 
       if (paymasterOptions.sponsorshipPolicyId) {
-        params.push({
-          sponsorshipPolicyId: paymasterOptions.sponsorshipPolicyId
-        })
+        paymasterContext.sponsorshipPolicyId = paymasterOptions.sponsorshipPolicyId
       }
+
+      params.push(paymasterContext)
 
       const sponsoredData = await paymasterClient.request({
         method: RPC_4337_CALLS.GET_PAYMASTER_DATA,
@@ -109,19 +153,29 @@ export class GenericFeeEstimator implements IFeeEstimator {
       params: [
         userOperationToHexValues(userOperation, entryPoint),
         entryPoint,
-        this.chainId,
+        toHex(chainId),
         { token: paymasterOptions.paymasterTokenAddress }
       ]
     })
 
+    if (
+      'verificationGasLimit' in erc20PaymasterData &&
+      erc20PaymasterData.verificationGasLimit != null
+    ) {
+      const threshold = await protocolKit.getThreshold()
+      erc20PaymasterData.verificationGasLimit = (
+        BigInt(erc20PaymasterData.verificationGasLimit) +
+        BigInt(threshold) * this.defaultVerificationGasLimitOverhead
+      ).toString()
+    }
     return erc20PaymasterData
   }
 
-  async #getUserOperationGasPrices(): Promise<
-    Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>
-  > {
+  async #getUserOperationGasPrices(
+    rpcUrl: string
+  ): Promise<Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>> {
     const client = createPublicClient({
-      transport: typeof this.provider === 'string' ? http(this.provider) : custom(this.provider)
+      transport: http(rpcUrl)
     })
     const [block, maxPriorityFeePerGas] = await Promise.all([
       client.getBlock({ blockTag: 'latest' }),
@@ -137,8 +191,14 @@ export class GenericFeeEstimator implements IFeeEstimator {
     // Calculate maxFeePerGas
     const maxFeePerGas = baseFeePerGas + maxPriorityFeePerGas
     return {
-      maxFeePerGas: BigInt(Math.ceil(Number(maxFeePerGas) * this.gasMultiplier)),
-      maxPriorityFeePerGas: BigInt(Math.ceil(Number(maxPriorityFeePerGas) * this.gasMultiplier))
+      maxFeePerGas: BigInt(
+        Math.ceil(Number(maxFeePerGas) * (this.overrides.maxFeePerGasMultiplier ?? 1.5))
+      ),
+      maxPriorityFeePerGas: BigInt(
+        Math.ceil(
+          Number(maxPriorityFeePerGas) * (this.overrides.maxPriorityFeePerGasMultiplier ?? 1.5)
+        )
+      )
     }
   }
 }

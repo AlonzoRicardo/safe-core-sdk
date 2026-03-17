@@ -3,7 +3,7 @@ import Safe, {
   DeploymentType,
   SafeProviderConfig,
   OnchainAnalyticsProps
-} from '@wdk-safe-global/protocol-kit'
+} from '@tetherto/wdk-safe-protocol-kit'
 import {
   EstimateGasData,
   MetaTransactionData,
@@ -11,8 +11,8 @@ import {
   SafeVersion,
   UserOperation
 } from '@safe-global/types-kit'
-import BaseSafeOperation from '@wdk-safe-global/relay-kit/packs/safe-4337/BaseSafeOperation'
-import { RPC_4337_CALLS } from '@wdk-safe-global/relay-kit/packs/safe-4337/constants'
+import BaseSafeOperation from '@tetherto/wdk-safe-relay-kit/packs/safe-4337/BaseSafeOperation'
+import { RPC_4337_CALLS } from '@tetherto/wdk-safe-relay-kit/packs/safe-4337/constants'
 
 export type ExistingSafeOptions = {
   safeAddress: string
@@ -29,6 +29,7 @@ export type PredictedSafeOptions = {
 export type SponsoredPaymasterOption = {
   isSponsored: true
   sponsorshipPolicyId?: string
+  paymasterContext?: Record<string, unknown>
 }
 
 export type ERC20PaymasterOption = {
@@ -82,6 +83,8 @@ export type Safe4337CreateTransactionProps = {
     feeEstimator?: IFeeEstimator
     customNonce?: bigint
     paymasterTokenAddress?: string
+    isSponsored?: boolean
+    sponsorshipPolicyId?: string
   }
 }
 
@@ -148,14 +151,10 @@ export type EstimateFeeFunctionProps = {
   bundlerUrl: string
   entryPoint: string
   paymasterOptions?: PaymasterOptions
+  protocolKit: Safe
 }
 
-export type EstimateFeeFunction = ({
-  userOperation,
-  bundlerUrl,
-  entryPoint,
-  paymasterOptions
-}: EstimateFeeFunctionProps) => Promise<EstimateGasData>
+export type EstimateFeeFunction = (props: EstimateFeeFunctionProps) => Promise<EstimateGasData>
 
 export interface IFeeEstimator {
   preEstimateUserOperationGas?: EstimateFeeFunction
