@@ -1,4 +1,4 @@
-import { createPublicClient, http, toHex } from 'viem'
+import { createPublicClient, Hex, http, RpcBlock, toHex } from 'viem'
 import { EstimateGasData } from '@safe-global/types-kit'
 import { EstimateFeeFunctionProps, IFeeEstimator, UserOperationStringValues } from '../../types'
 import { createBundlerClient, userOperationToHexValues } from '../../utils'
@@ -15,6 +15,10 @@ export type GenericFeeEstimatorOverrides = {
   defaultVerificationGasLimitOverhead?: bigint
 }
 
+export type GenericEip1193Provider = {
+  request: (args: { method: string; params?: unknown[] }) => Promise<unknown>
+}
+
 /**
  * GenericFeeEstimator is a class that implements the IFeeEstimator interface. You can implement three optional methods that will be called during the estimation process:
  * - preEstimateUserOperationGas: Setup the userOperation before calling the eth_estimateUserOperation gas method.
@@ -23,13 +27,13 @@ export type GenericFeeEstimatorOverrides = {
 export class GenericFeeEstimator implements IFeeEstimator {
   defaultVerificationGasLimitOverhead: bigint
   overrides: GenericFeeEstimatorOverrides
-  rpcUrl: string
+  rpc: string | GenericEip1193Provider
 
-  constructor(rpcUrl: string, overrides: GenericFeeEstimatorOverrides = {}) {
+  constructor(rpc: string | GenericEip1193Provider, overrides: GenericFeeEstimatorOverrides = {}) {
     this.defaultVerificationGasLimitOverhead =
       overrides.defaultVerificationGasLimitOverhead ?? 35_000n
     this.overrides = overrides
-    this.rpcUrl = rpcUrl
+    this.rpc = rpc
   }
 
   async preEstimateUserOperationGas({
@@ -52,7 +56,7 @@ export class GenericFeeEstimator implements IFeeEstimator {
           : (paymasterOptions.paymasterContext ?? {})
 
       const [feeData, paymasterStubData] = await Promise.all([
-        this.#getUserOperationGasPrices(this.rpcUrl),
+        this.#getUserOperationGasPrices(this.rpc),
         paymasterClient.request({
           method: RPC_4337_CALLS.GET_PAYMASTER_STUB_DATA,
           params: [
@@ -66,7 +70,7 @@ export class GenericFeeEstimator implements IFeeEstimator {
       feeDataRes = feeData
       paymasterStubDataRes = paymasterStubData
     } else {
-      const feeData = await this.#getUserOperationGasPrices(this.rpcUrl)
+      const feeData = await this.#getUserOperationGasPrices(this.rpc)
       feeDataRes = feeData
     }
 
@@ -172,15 +176,13 @@ export class GenericFeeEstimator implements IFeeEstimator {
   }
 
   async #getUserOperationGasPrices(
-    rpcUrl: string
+    rpc: string | GenericEip1193Provider
   ): Promise<Pick<EstimateGasData, 'maxFeePerGas' | 'maxPriorityFeePerGas'>> {
-    const client = createPublicClient({
-      transport: http(rpcUrl)
-    })
-    const [block, maxPriorityFeePerGas] = await Promise.all([
-      client.getBlock({ blockTag: 'latest' }),
-      client.estimateMaxPriorityFeePerGas()
-    ])
+    const client = typeof rpc === 'string' ? createPublicClient({ transport: http(rpc) }) : rpc
+    const [block, maxPriorityFeePerGas] = (await Promise.all([
+      client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] }),
+      client.request({ method: 'eth_maxPriorityFeePerGas' })
+    ])) as [RpcBlock, Hex]
     // Base fee from the block (can be undefined for non-EIP1559 blocks)
     const baseFeePerGas = block.baseFeePerGas
 
@@ -189,7 +191,7 @@ export class GenericFeeEstimator implements IFeeEstimator {
     }
 
     // Calculate maxFeePerGas
-    const maxFeePerGas = baseFeePerGas + maxPriorityFeePerGas
+    const maxFeePerGas = BigInt(baseFeePerGas) + BigInt(maxPriorityFeePerGas)
     return {
       maxFeePerGas: BigInt(
         Math.ceil(Number(maxFeePerGas) * (this.overrides.maxFeePerGasMultiplier ?? 1.5))
